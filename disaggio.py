@@ -7,29 +7,30 @@ Multi-Regional Input-Output (MRIO) analysis.
 Mutahar Chalmers, 2016.
 """
 
-from os.path import join, realpath, dirname
 from json import load
 import numpy as np
 import pandas as pd
 import pyras as ras
 
 
-def disagg(f_Zagg, f_xagg, fullZ=False):
+def disagg(f_sttgs='sttgs_disagg.json'):
     """Load IO data in 'standard' aggregate form and disaggregate."""
 
-    pwd = dirname(realpath(__file__))
-    with open(join(pwd, 'settings_disagg.json')) as f:
-        settings = load(f)
+    with open(f_sttgs) as f:
+        sttgs = load(f)
 
-    reg_data = pd.read_csv(join(pwd, 'regions.csv'), index_col='id')
+    # Load aggregate IO tables in standard format
+    Z0 = pd.read_csv(sttgs['Z_filein'], index_col=0)
+    x0 = pd.read_csv(sttgs['x_filein'], index_col=0)['x0']
+
+    reg_data = pd.read_csv(sttgs['regs_file'], index_col=sttgs['regs_ix'])
     regs, secs = reg_data.index, reg_data.columns[2:]
+    n_regs = regs.size
+
+    fullZ = sttgs['fullZ']
 
     # Index of disaggregated DataFrame
     ix = pd.MultiIndex.from_product([regs, secs])
-
-    # Load aggregate IO tables in standard format
-    Z0 = pd.read_csv(join(pwd, 'agg', f_Zagg), index_col=0)
-    x0 = pd.read_csv(join(pwd, 'agg', f_xagg), index_col=0)['x0']
 
     # Initial Location Quotients (LQs) from region data
     LQ0 = reg_data[secs]
@@ -82,7 +83,7 @@ def disagg(f_Zagg, f_xagg, fullZ=False):
         Z_r0.append(intrarow)
 
         # Generate first estimate of inter-regional flow matrix 
-        interrow = [Z_Rr/(regs.size-1) if r!=s else zero for s in regs]
+        interrow = [Z_Rr/(n_regs-1) if r!=s else zero for s in regs]
         Z_R0.append(interrow)
 
     print('Complete.')
@@ -96,27 +97,41 @@ def disagg(f_Zagg, f_xagg, fullZ=False):
     U_t, V_t = np.vstack(U), np.hstack(V)
 
     #=FIXME Temporary hack to get round inconsistent U and V margins ==========
-    sc = sum(ras.hblock(V_t, regs.size))/sum(ras.vblock(U_t, regs.size))
+    sc = sum(ras.hblock(V_t, n_regs))/sum(ras.vblock(U_t, n_regs))
     sc[np.isnan(sc)] = 1
-    U_t = np.vstack(ras.vblock(U_t, regs.size) * sc)
+    U_t = np.vstack(ras.vblock(U_t, n_regs) * sc)
     #==========================================================================
 
     # Carry out RAS balancing
+    # RAS-specific settings
+    sRAS = sttgs['RAS']
     print('\nRAS biproportional balancing...')
     if fullZ:
-        result = ras.RAS(Z_r0+Z_R0, U_t, V_t, blocks=(regs.size, regs.size))
-        if result is not None:
+        res = ras.RAS(Z_r0+Z_R0, U_t, V_t, blocks=(n_regs, n_regs), **sRAS)
+        print('Complete.')
+        if res is not None:
+            Z_out, convg = res
+            print('\nConvergence:')
+            print(pd.Series(convg).to_string())
+            Z_out = pd.DataFrame(Z_out, index=ix, columns=ix)
+            print('\nWriting files...')
+            Z_out.to_csv(sttgs['Z_fileout'])
+            X_rs.to_csv(sttgs['x_fileout'])
             print('Complete.\n')
-            Z_out, convg = result
-            print(pd.Series(convg))
-            return pd.DataFrame(Z_out, index=ix, columns=ix), X_rs
+            return Z_out, X_rs
     else:
-        result = ras.RAS(Z_R0, U_t, V_t, blocks=(regs.size, regs.size))
-        if result is not None:
+        res = ras.RAS(Z_R0, U_t, V_t, blocks=(n_regs, n_regs), **sRAS)
+        print('Complete.')
+        if res is not None:
+            Z_out, convg = res
+            print('\nConvergence:')
+            print(pd.Series(convg).to_string())
+            Z_out = pd.DataFrame(Z_out+Z_r0, index=ix, columns=ix)
+            print('\nWriting files...')
+            Z_out.to_csv(sttgs['Z_fileout'])
+            X_rs.to_csv(sttgs['x_fileout'])
             print('Complete.\n')
-            Z_out, convg = result
-            print(pd.Series(convg))
-            return pd.DataFrame(Z_out + Z_r0, index=ix, columns=ix), X_rs
+            return Z_out, X_rs
     print('No result.')
 
 
