@@ -49,9 +49,8 @@ def disagg(f_Zagg, f_xagg, fullZ=False):
     Z_r0, Z_R0, U, V =  [], [], [], []
 
     # Loop through regions and recalculate LQs for r and R ('not r')
+    print('\nInitial estimates of intra- and inter-regional matrices...')
     for r in regs:
-        print('Processing {0} {1}...'.format(r, reg_data.ix[r, 'name']))
-
         # Calculate output by sector for r and R, and recalculate LQs
         X = X_rs.copy()
         X.ix['R'] = X[X.index!=r].sum(axis=0)
@@ -86,6 +85,8 @@ def disagg(f_Zagg, f_xagg, fullZ=False):
         interrow = [Z_Rr/(regs.size-1) if r!=s else zero for s in regs]
         Z_R0.append(interrow)
 
+    print('Complete.')
+
     # Intra- and inter-regional flow matrices
     # Explicit C-ordering for RAS functions (pandas DataFrames Fortran-order)
     Z_r0 = np.array(np.bmat(Z_r0), order='C')
@@ -101,19 +102,21 @@ def disagg(f_Zagg, f_xagg, fullZ=False):
     #==========================================================================
 
     # Carry out RAS balancing
-    print('RAS biproportional balancing...')
+    print('\nRAS biproportional balancing...')
     if fullZ:
         result = ras.RAS(Z_r0+Z_R0, U_t, V_t, blocks=(regs.size, regs.size))
         if result is not None:
+            print('Complete.\n')
             Z_out, convg = result
             print(pd.Series(convg))
-            return pd.DataFrame(Z_out, index=ix, columns=ix)
+            return pd.DataFrame(Z_out, index=ix, columns=ix), X_rs
     else:
         result = ras.RAS(Z_R0, U_t, V_t, blocks=(regs.size, regs.size))
         if result is not None:
+            print('Complete.\n')
             Z_out, convg = result
             print(pd.Series(convg))
-            return pd.DataFrame(Z_out + Z_r0, index=ix, columns=ix)
+            return pd.DataFrame(Z_out + Z_r0, index=ix, columns=ix), X_rs
     print('No result.')
 
 
