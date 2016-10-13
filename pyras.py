@@ -16,7 +16,7 @@ def hblock(Z, n):
     if np.isfortran(Z):
         print('Warning: input array is Fortran-ordered!')
     shape = (n, Z.shape[0], Z.shape[1]//n)
-    strides = np.array([Z.shape[1]/n, Z.shape[1], 1]) * Z.itemsize
+    strides = np.array([Z.shape[1]//n, Z.shape[1], 1]) * Z.itemsize
     return ast(Z, shape=shape, strides=strides)
 
 
@@ -26,7 +26,7 @@ def vblock(Z, n):
     if np.isfortran(Z):
         print('Warning: input array is Fortran-ordered!')
     shape = (n, Z.shape[0]//n, Z.shape[1])
-    strides = np.array([Z.shape[0]/n*Z.shape[1], Z.shape[1], 1]) * Z.itemsize
+    strides = np.array([Z.shape[0]//n*Z.shape[1], Z.shape[1], 1]) * Z.itemsize
     return ast(Z, shape=shape, strides=strides)
 
 
