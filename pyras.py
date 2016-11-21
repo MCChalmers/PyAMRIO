@@ -9,6 +9,8 @@ Mutahar Chalmers, 2016.
 import numpy as np
 from numpy.lib.stride_tricks import as_strided as ast
 
+np.seterr(divide='ignore', invalid='ignore')
+
 
 def hblock(Z, n):
     """Use numpy stride tricks to access blocks. Assumes C order."""
