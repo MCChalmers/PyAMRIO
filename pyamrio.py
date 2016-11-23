@@ -1,329 +1,289 @@
 # coding: utf-8
 
-# Python implementation of Adaptive Regional Input-Output (ARIO) model
-# based on Hallegatte (2008).
-from os.path import join, realpath, dirname
-from os import listdir
+"""
+Python implementation of Adaptive Multi-Regional Input-Output (AMRIO) model.
+
+Mutahar Chalmers, 2016.
+"""
+
+from os.path import join, exists
+from os import listdir, makedirs
 from json import load
 import numpy as np
 import pandas as pd
-from scipy.optimize import linprog
 from scipy.linalg import block_diag
 
-pwd = dirname(realpath(__file__))
+
+__version__ = '0.1.0'
 
 class PyAMRIO():
-    """Load settings and sectors information."""
+    """Load settings, regions, sectors and IO information."""
 
-    def __init__(self):
-        with open(join(pwd, 'settings.json')) as f:
+    def __init__(self, f_sttgs):
+        with open(f_sttgs) as f:
             self.settings = load(f)
-
-        self.reg_data = pd.read_csv(join(pwd, 'regions.csv'), index_col='id')
-        self.n_reg = self.reg_data.index.size
-        self.sec_data = pd.read_csv(join(pwd, 'sectors.csv'), index_col='id')
-        self.n_sec = self.sec_data.index.size
-        self.n_ts = 0 
-
-        # Define index of multiregion, multisector technology matrix
-        self.ix = ['r{0}_c{1}'.format(r+1, c+1) for r in range(self.n_reg) for c in range(self.n_sec)]
+        sttgs_list = str(list(range(len(self.settings))))
+        print('Settings {0} available.'.format(sttgs_list))
 
 
-    def disagg(self, fname='USA_NIOT_2011.csv'):
-        """Load raw national IO data in 'standard' form and disaggregate."""
+    def load(self, n):
+        """Process nth settings configuration."""
 
-        # Inter-industry sectors are endogenous
-        sectors_ii = self.sec_data[self.sec_data['exog']==0].index
+        sttgs = self.settings[n]
+        self.desc = sttgs['desc']
+        print('Loading data for analysis: {0}'.format(self.desc))
 
-        # Location quotients from region data
-        self.LQ = self.reg_data[sectors_ii]
+        rpath = sttgs['root_path']
+        self.opath = join(sttgs['out_rpath'], self.desc)
+        if not exists(self.opath):
+            makedirs(self.opath)
 
-        # Load national IO table
-        niot = pd.read_csv(join(pwd, 'raw', fname))
+        if len(self.opath) > 0:
+            with open(join(self.opath, 'settings.json'), 'w') as f:
+                sout = ',\n '.join(['"{0}": "{1}"'.format(k, v)
+                                    for k, v in sttgs.items()])
+                f.writelines('{\n '+sout+'\n}')
 
-        locmask = niot['location'] != 'Imports'
-        impmask = niot['location'] == 'Imports'
+        self.reg_data = pd.read_csv(join(rpath, sttgs['regs_file']), index_col=0)
+        self.regs = self.reg_data.index
+        self.n_reg = self.regs.size
+        sec_data = pd.read_csv(join(rpath, sttgs['secs_file']), index_col=0)
+        self.sec_data = pd.concat({r: sec_data for r in self.regs}, keys=self.regs)
 
-        # Households endogenous
-        if self.settings['hhold_sup_id'] in sectors_ii: 
-            consump = [dmd for dmd in self.settings['dmd_ids'] if dmd != self.settings['hhold_dmd_id']] 
-            niot[self.settings['hhold_sup_id']] = niot[self.settings['hhold_dmd_id']]
-            exomask = np.ones_like(niot['id'], dtype=bool)
-        # Households exogenous   
-        else:
-            consump = self.settings['dmd_ids'] 
-            exomask = niot['id'].isin(sectors_ii)
- 
-        # Total output by sector 
-        self.y0 = niot[locmask & exomask].set_index('id')['TotalOutput']
-        
-        # Output by region
-        self.yr = self.reg_data['grp'].mul(self.y0.sum())
+        self.secs = self.sec_data.index
+        self.n_sec = self.secs.size
+        self.dt = sttgs['dt_1']
+        self.eps = sttgs['eps']
+        self.convg_lim = sttgs['convg_lim']
+        self.Ed = sttgs['Ed']
+        self.xi = sttgs['xi']
 
-        # Direct requirements table (domestic industries only)
-        self.Z0 = niot[locmask & exomask].set_index('id')[sectors_ii]
-        
-        # National technology matrix (scale inputs to unit output)
-        self.A0 = self.Z0.divide(self.y0, axis=1)       
+        # Load disaggregated IO tables in standard format
+        self.Z0 = pd.read_csv(join(rpath, sttgs['Z_file']), index_col=[0,1], header=[0,1])
+        self.M0 = pd.read_csv(join(rpath, sttgs['M_file']), index_col=[0], header=[0,1])
+        self.x0 = pd.read_csv(join(rpath, sttgs['x_file']), index_col=0).T.unstack()
+        self.exp0 = pd.read_csv(join(rpath, sttgs['e_file']), index_col=0).T.unstack()
 
-        # Output by region by sector
-        self.yir = self.LQ.mul(self.yr, axis=0).mul(self.y0/self.y0.sum(), axis=1)
-
-        # Loop through regions and apply Location Quotients
-        zero = np.zeros((self.A0.shape))
-        self.A, self.Z_in, self.Z_out = {}, {}, {}
-        self.Zr0 =  []
-        for i, r in enumerate(self.LQ.index):
-            # Output by region for non-r regions
-            ynotr = self.yr[self.yr.index!=r]
-            # Output by sector for non-r regions
-            yinotr = self.yir[self.yir.index!=r].sum(axis=0)
-
-            # Select LQ for region r and clip to 1
-            LQr = self.LQ.ix[r].clip(upper=1)
-            # Calculate LQ for region ~r and clip to 1
-            LQnotr = ((yinotr/ynotr.sum())/(self.y0/self.y0.sum())).clip(upper=1)
-
-            # Generate Arr
-            self.A['{0}{0}'.format(r)] = self.A0.mul(LQr, axis=1)
-            self.Z_in['{0}{0}'.format(r)] = self.A['{0}{0}'.format(r)].mul(self.yir.ix[r], axis=1)
-
-            # Generate import coefficients A~rr
-            self.A['~{0}{0}'.format(r)] = self.A0 - self.A['{0}{0}'.format(r)]
-            self.Z_in['~{0}{0}'.format(r)] = self.A['~{0}{0}'.format(r)].mul(self.yir.ix[r], axis=1)
-
-            # Generate LQs for ~r~r and then A~r~r (all other non-r regions together)
-            self.A['~{0}~{0}'.format(r)] = self.A0.mul(LQnotr, axis=1)
-            self.Z_in['~{0}~{0}'.format(r)] = self.A['~{0}~{0}'.format(r)].mul(yinotr, axis=1)
-
-            # Generate export coefficients Ar~r
-            self.A['{0}~{0}'.format(r)] = self.A0 - self.A['~{0}~{0}'.format(r)]
-            self.Z_in['{0}~{0}'.format(r)] = self.A['{0}~{0}'.format(r)].mul(yinotr, axis=1)
-        
-            self.Zr0.append([])
-            for j, s in enumerate(self.LQ.index):
-                if r != s:
-                    self.Zr0[-1].append((self.Z_in['{0}~{0}'.format(r)]/(self.n_reg-1)).values)
-                    self.Z_out['{0}{1}'.format(r, s)] = self.Z_in['{0}~{0}'.format(r)]/(self.n_reg-1)
-                else:
-                    self.Zr0[-1].append(zero)
-                    self.Z_out['{0}{1}'.format(r, s)] = pd.DataFrame(zero, index=sectors_ii, columns=sectors_ii)
-
-        # Initial estimate of inter-regional flow matrix
-        Zr = np.bmat(self.Zr0)
-        Zr[Zr==0] = 1
-
-        U_target = block_diag(*[self.Z_in['{0}~{0}'.format(r)].values for r in self.reg_data.index]) 
-        V_target = block_diag(*[self.Z_in['~{0}{0}'.format(r)].values for r in self.reg_data.index]) 
-
-        # RAS iterations
-        for i in range(self.settings['RAS_itrmax']):
-            U_actual = block_diag(*np.split(sum(np.split(Zr, self.n_reg, axis=1)), self.n_reg, axis=0))
-            V_actual = block_diag(*np.split(sum(np.split(Zr, self.n_reg, axis=0)), self.n_reg, axis=1))
-            R = U_target/U_actual
-            R[np.isnan(R)|np.isinf(R)] = 0
-            S = V_target/V_actual
-            S[np.isnan(S)|np.isinf(S)] = 0
-            Zr = R*Zr*S
-            Zr[Zr==0] = 1
-
-            # Add Zrr along main diagonal
-            self.Z = Zr + block_diag(*[self.Z_in['{0}{0}'.format(r)].values for r in self.reg_data.index]) 
-            # Sum of regional inter-industry transactions == national inter-industry transactions
-            self.Z_check = pd.DataFrame(sum(np.split(sum(np.split(self.Z, self.n_reg, axis=1)), self.n_reg, axis=0)), index=sectors_ii, columns=sectors_ii)
-            convg = np.abs(self.Z_check - self.Z0).values.max()
-            print(i, convg)
-            if convg < self.settings['RAS_convg']:
-                break
-
-        # Local final demand
-        lfd0 = niot[locmask & exomask].set_index('id')[consump].sum(axis=1)
-
-        # Imports matrix - flatten and scale to unit output (like A)
-        imp0 = niot[impmask & exomask].set_index('id')[sectors_ii].sum(axis=0)
-        
-        # Exports
-        exp0 = niot[locmask & exomask].set_index('id')[self.settings['export_id']]
-
-        # Labour
-        lab0 = niot[(niot['id']==self.settings['hhold_sup_id'])&~impmask][sectors_ii].sum(axis=0)
-
-        self.impexplab = pd.DataFrame({'imp0': imp0, 'exp0': exp0, 'lab0': lab0})
-
-
-    def proc(self):
-        """Load processed/disaggregated IO data."""
-
-        ix, n_reg, n_sec, n_ts = self.ix, self.n_reg, self.n_sec, self.n_ts
-        lfd_dict, ymax_dict, y_dict, A_dict, iel_dict = {}, {}, {}, {}, {}
-        for fname_ in listdir(join(pwd, 'data')):
-            fname = fname_[:-4].split('_')
-            fpath = join(pwd, 'data', fname_)
-            if fname[0] == 'lfd':
-                lfd_dict[fname[-1]] = pd.read_csv(fpath, index_col='id')
-            elif fname[0] == 'y':
-                y_dict[fname[-1]] = pd.read_csv(fpath, index_col='id')
-            elif fname[0] == 'ymax':
-                ymax_dict[fname[-1]] = pd.read_csv(fpath, index_col='t')
-                n_ts = max(n_ts, ymax_dict[fname[-1]].shape[0])
-            elif fname[0] == 'impexplab':
-                iel_dict[fname[-1]] = pd.read_csv(fpath, index_col='id')
-            elif fname[0] == 'A':
-                A_dict[fname[-2]+fname[-1]] = pd.read_csv(fpath, index_col='id')
-
-        #TODO - insert checks and validation that data loaded correctly
-
-        self.A0 = pd.DataFrame(np.zeros((n_reg*n_sec, n_reg*n_sec)), index=ix, columns=ix)
-        self.lfd0 = pd.Series(np.zeros(n_reg*n_sec), index=ix)
-        self.y0 = pd.Series(np.zeros(n_reg*n_sec), index=ix)
-        self.imp0 = pd.Series(np.zeros(n_reg*n_sec), index=ix)
-        self.exp0 = pd.Series(np.zeros(n_reg*n_sec), index=ix)
-        self.lab0 = pd.Series(np.zeros(n_reg*n_sec), index=ix)
-        self.ymax = pd.DataFrame(np.zeros((n_ts, n_reg*n_sec)), columns=ix)
-       
-        # Fill Series/DataFrames in correct order
-        for r in range(n_reg):
-            self.lfd0.ix[r*n_sec:(r+1)*n_sec] = lfd_dict['r{0}'.format(r+1)]['lfd0'].values
-            self.y0.ix[r*n_sec:(r+1)*n_sec] = y_dict['r{0}'.format(r+1)]['y0'].values
-            self.imp0.ix[r*n_sec:(r+1)*n_sec] = iel_dict['r{0}'.format(r+1)]['imp0'].values.flatten()
-            self.exp0.ix[r*n_sec:(r+1)*n_sec] = iel_dict['r{0}'.format(r+1)]['exp0'].values.flatten()
-            self.lab0.ix[r*n_sec:(r+1)*n_sec] = iel_dict['r{0}'.format(r+1)]['lab0'].values.flatten()
-            self.ymax.ix[:, r*n_sec:(r+1)*n_sec] = ymax_dict['r{0}'.format(r+1)].values
-            for s in range(n_reg):
-                self.A0.ix[r*n_sec:(r+1)*n_sec, s*n_sec:(s+1)*n_sec] = A_dict['r{0}s{1}'.format(r+1,s+1)].values
-
-        # Inital intermediate consumption (orders)
-        self.o0 = self.A0.dot(self.y0)                                        
-
-        # Leontief inverse
-        self.L0 = pd.DataFrame(np.linalg.inv(np.eye(self.A0.shape[0])-self.A0), index=ix, columns=ix)
-
-        # Normalise imports and labour by total output (convention)
-        self.imp0 = self.imp0/self.y0
-        self.lab0 = self.lab0/self.y0
+        # Calculate local and import technical coefficients and orders
+        self.A0 = self.Z0.div(self.x0, axis=1)
+        self.o0 = self.A0.dot(self.x0)
 
         # Value added (total output less intermediate consumption)
-        self.va0 = self.y0 - self.A0.dot(self.y0).sum(axis=0) 
+        self.va0 = self.x0 - self.Z0.sum(axis=0) - self.M0.sum(axis=0)
+
+        # Local final demand
+        self.lfd0 = self.x0 - self.o0 - self.exp0
+
+        # Normalise imports by total output
+        self.imp0 = self.M0.sum(axis=0).div(self.x0)
+
+        # Calculate labour input
+        # Proportional contributions of labour and capital to Gross Value Added
+        gva_norm = pd.read_csv(join(rpath, sttgs['GVA_file']), index_col=0)
+
+        # Disaggregated labour input (labour:capital regionally invariant)
+        self.lab0 = self.va0.mul(gva_norm['LAB'], level=1).div(self.x0)
 
         # Profits
-        self.prof0 = self.y0 - self.o0 - (self.lab0 + self.imp0)*self.y0
+        self.prof0 = self.x0 - self.o0 - (self.lab0 + self.imp0)*self.x0
 
         # Industries which are subsitutable by imports
         self.sig = self.sec_data['sig']
-        
+
         # Initialise price vector
-        self.p0 = np.ones(n_reg*n_sec)
+        self.p0 = np.ones(self.n_sec)
 
         # Pre-event balance of supply & demand
-        self.sd_bal0 = np.abs(self.lfd0 + self.exp0 + self.o0 - self.y0).max()
-        if self.sd_bal0 > self.settings['convg_lim']:
-            print('Warning: initial supply-demand balance not satisfied: {0:3.4e}'.format(self.sd_bal0))
-        # -------------------------------------------------------------------------------------------------------------
+        sd_bal0 = np.abs(self.lfd0 + self.exp0 + self.o0 - self.x0).max()
+        if sd_bal0 > sttgs['convg_lim']:
+            print('Initial supply-demand imbalance: {0:3.4e}'.format(sd_bal0))
+
+        # Multi-region and sector index - used to set up new DataFrames
+        self.ix = self.Z0.index
+
+        # Load supply constraint data and assemble matrix
+        Cmax = pd.read_csv(join(rpath, sttgs['c_max']), index_col=[0,1])
+        self.x_max0 = pd.concat({reg: Cmax.ix[reg].mul(self.x0.ix[reg], axis=0)
+                                 for reg in self.regs}).ix[self.regs]
+
+        print('Data loaded successfully.')
 
 
-    def f_p(self, y_t, td_t, Ep):
+    def f_p(self, x_t, td_t, Ep):
         """Calculate sector prices given excess demand factor."""
-        return self.p0*(1+Ep*((td_t-y_t)/y_t))
+        return self.p0*(1 + Ep*((td_t - x_t) / x_t))
 
 
-    def calc_va(self, y, A, imports, labour):
-        """Calculate Gross Value Added."""
-        return y - (A.multiply(y, axis=1).sum(axis=0) + imports*y + labour*y)
+    def bottleneck(self, x, A, f, x_max, itr_max=50, eps=1e-6, verbose=False):
+        """Hallegatte's priority + proportional rationing algorithm."""
+
+        L = np.linalg.inv(np.eye(A.shape[0])-A)
+        td = L.dot(f)
+        x = np.minimum(x_max, td)
+
+        for i in range(itr_max):
+            # For checking convergence
+            x0 = x.copy()
+
+            # Calculate orders and total demand
+            o = A.dot(x)
+            chk = np.array(x/o).clip(max=1)
+            sc = chk.min()
+            x[chk==1] = x[chk==1]*sc
+
+            # Recalculate total demand
+            td = A.dot(x) + f
+            x = np.minimum(np.minimum(x_max, td), x)
+
+            # Check convergence
+            if (np.abs(x - x0).max() < eps):
+                if verbose:
+                    print('Converged in {0} iterations.'.format(i))
+                    print('Minimum x/o: {0:.3e}'.format((x/A.dot(x)).min()))
+                return x, o, td
+        print('## Not converged ##')
+        return None
 
 
     def amrio(self):
         """Run model."""
 
-        y_t, lfd_t, imp_t, exp_t, lab_t = self.y0.copy(), self.lfd0.copy(), self.imp0.copy(), self.exp0.copy(), self.lab0.copy() 
+        x_t = self.x0.copy()
+        lfd_t = self.lfd0.copy()
+        exp_t = self.exp0.copy()
+        imp_t = self.imp0.copy()
+        lab_t = self.lab0.copy()
+        dt, eps = self.dt, self.eps
+
         A_t = self.A0.copy()
-        td_t = self.A0.dot(self.y0) + self.lfd0 + self.exp0
 
-        m, n = self.prod_data.shape[0], self.sectors.shape[0]
-        dt = self.settings['dt_1']
-        eps = self.settings['eps']
+        # Number of region-sectors; number of time steps; 
+        n, m = self.x_max0.shape
+        if self.x_max0.ix[:,-1].min() < 1:
+            print('Extending AMRIO model beyond duration of c_max...')
+            extension = pd.concat([self.x0]*m, axis=1)
+            self.x_max0 = pd.concat([self.x_max0, extension], axis=1)
+            m = 2*m
 
-        a_t = pd.Series(np.ones(n), index=self.sectors, name='a_t')
-        a_max = self.sector_data['a_max'].ix[self.sectors]
-        a0 = self.sector_data['a0'].ix[self.sectors]
+        a_t = pd.Series(np.ones(self.n_sec), index=self.secs, name='a_t')
+        a_max = self.sec_data['a_max'].ix[self.secs]
+        a0 = self.sec_data['a0'].ix[self.secs]
 
-        y_out = np.zeros((m, n))
-        lfd_out = np.zeros((m, n))
-        imp_out = np.zeros((m, n))
-        exp_out = np.zeros((m, n))
-        va_out = np.zeros((m, n))
+        x_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
+        lfd_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
+        exp_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
+        imp_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
+        va_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
 
         # Time stepping
-        for ix_t, y_max_t in self.prod_data.iterrows():
-            y_max =  self.y0 * y_max_t.values * a_t
-            
-            # Production bottlenecking - solve LP problem such that orders are satisfied first
-            res = linprog(-np.ones(n), A_ub=np.vstack((np.eye(n)-A_t, np.eye(n))),
-                          b_ub=np.hstack((lfd_t+exp_t, y_max)), options={'disp': False})
-            y_t = pd.Series(res['x'], index=self.sectors)
+        print('AMRIO model running...')
+        for ix_t, x_max_t in self.x_max0.iteritems():
+            # Increase maximum output by overproduction factor
+            x_max = x_max_t.mul(a_t, level=1, axis=0)
 
-            # Recalculate orders based on adjusted output
-            o_t = A_t.dot(y_t)
-            
-            # Check Leontief equation is satisfied
-            sc = (y_t-o_t)/(self.y0-self.o0)
-            sd_bal = np.abs(self.lfd0*sc + self.exp0*sc + o_t - y_t).max()
-            if sd_bal > self.settings['convg_lim']:
-                print('Supply-demand balance at timestep {0} not satisfied: {1:3.4e}'.format(int(ix_t), sd_bal))
-                break
+            # Production bottlenecking
+            x_t, o_t, td_t = self.bottleneck(x_t, A_t, lfd_t+exp_t, x_max)
 
-            # Recalculate total demand using actual orders and adapted LFD and exports
-            td_t = lfd_t + exp_t + o_t
+            # Excess demand factor
+            xs_dmd = ((td_t-x_t)/td_t).clip(lower=0)
 
             # Prices, profits and labour demand
-            p_t = self.f_p(y_t, td_t, self.settings['Ed'])
-            prof_t = p_t*y_t - (A_t.mul(p_t, axis=1).dot(y_t) + lab_t*y_t + imp_t*y_t)
-            M_t = (prof_t + lab_t*y_t).sum()/(self.prof0 + self.lab0*self.y0).sum()
+            p_t = self.f_p(x_t, td_t, self.Ed)
+            prof_t = p_t*x_t - (A_t.mul(p_t, axis=1).dot(x_t) + (lab_t+imp_t)*x_t)
+            Macro_t = (prof_t + lab_t*x_t).sum()/(self.prof0 + self.lab0*self.x0).sum()
 
-            # Adaptation =======================================================
-            # Excess demand factor
-            xs_dmd = (td_t-y_t)/td_t
-
+            # Adaptation ======================================================
             # If total demand exceeds supply
-            mask = td_t - y_t > 1
+            mask = td_t - x_t > 1
+            sig = self.sig[mask]
+            sig_ = self.sig[~mask]
+            xs = xs_dmd[mask]
+            sec_mask = self.sec_data.ix[mask]
+            sec_mask_ = self.sec_data.ix[~mask]
 
-            # Final demand adaptation - final demand and exports reduce---------
-            lfd_t[mask] = lfd_t[mask] - self.sig[mask]*xs_dmd[mask]*lfd_t[mask]*dt/self.sector_data['tau_lfd_down'].ix[self.sectors]
-            exp_t[mask] = exp_t[mask] - self.sig[mask]*xs_dmd[mask]*exp_t[mask]*dt/self.sector_data['tau_exp_down'].ix[self.sectors]
-            
-            # Intermediate consumption adaptation - inter-industry consumption reduces and imports increase
-            delta = A_t.ix[mask,:].mul(xs_dmd[mask]*self.sig[mask], axis=0)*dt/self.sector_data['tau_A_down'].ix[self.sectors]
-            A_t.ix[mask,:] = A_t.ix[mask,:] - delta
-            imp_t = imp_t + delta.sum(axis=0)
+            # Final demand - final demand and exports reduce--------
+            lfd_t[mask] = lfd_t[mask]*(1-sig*xs*dt/sec_mask['tau_lfd_down'])
+            exp_t[mask] = exp_t[mask]*(1-sig*xs*dt/sec_mask['tau_exp_down'])
 
-            # Production adaptation - overproduction where possible
-            a_t[mask] = a_max[mask] + (a_max[mask]-a_t[mask]) * xs_dmd[mask] * dt/self.sector_data['tau_a'].ix[self.sectors]
+            # Intermediate consumption - inter-industry consumption reduces and imports increase
+            delta = A_t.ix[mask].mul(xs_dmd[mask]*sig, axis=0).div(sec_mask['tau_A_down'], axis=0)
+            A_t.ix[mask] = A_t.ix[mask] - delta*dt
+            imp_t[mask] = imp_t[mask] + delta.sum(axis=1)*dt
 
-            # Otherwise... -----------------------------------------------------
+            # Production - overproduction where possible
+            a_t[mask] = a_max[mask] + (a_max[mask]-a_t[mask]) * xs_dmd[mask] *dt/sec_mask['tau_a']
+
+            # Otherwise... ----------------------------------------------------
             # Local final demands and exports recover to pre-disaster levels
-            lfd_fac = (eps+lfd_t[~mask]/self.lfd0[~mask])*(self.lfd0[~mask]-lfd_t[~mask])*dt/self.sector_data['tau_lfd_up'].ix[self.sectors]
-            lfd_t[~mask] = lfd_t[~mask] + self.sig[~mask]*lfd_fac[~mask]
-            exp_fac = (eps+exp_t[~mask]/self.exp0[~mask])*(self.exp0[~mask]-exp_t[~mask])*dt/self.sector_data['tau_exp_up'].ix[self.sectors]
-            exp_t[~mask] = exp_t[~mask] + self.sig[~mask]*exp_fac[~mask]
+            lfd_fac = (eps+lfd_t[~mask]/self.lfd0[~mask])*(self.lfd0[~mask]-lfd_t[~mask]).div(sec_mask_['tau_lfd_up'], axis=0)
+            lfd_t[~mask] = lfd_t[~mask] + sig_*lfd_fac[~mask]*dt
+            exp_fac = (eps+exp_t[~mask]/self.exp0[~mask])*(self.exp0[~mask]-exp_t[~mask]).div(sec_mask_['tau_exp_up'], axis=0)
+            exp_t[~mask] = exp_t[~mask] + sig_*exp_fac[~mask]*dt
 
             # Intermediate consumption recovers to pre-disaster levels
-            A_fac = ((eps+A_t/self.A0)*(self.A0-A_t)).fillna(0)
-            A_t = A_t + A_fac*dt/self.sector_data['tau_A_up'].ix[self.sectors]
-            imp_t = imp_t - A_fac.sum(axis=0)*dt/self.sector_data['tau_A_up'].ix[self.sectors]
-            #imp_t[~mask] = imp_t[~mask] - A_fac.sum(axis=0)[~mask]*dt/self.sector_data['tau_A_up'].ix[self.sectors]
+            A_fac1 = (eps+A_t.ix[~mask]/self.A0.ix[~mask])
+            A_fac2 = (self.A0.ix[~mask]-A_t.ix[~mask])
+            A_fac = (A_fac1*A_fac2).div(sec_mask_['tau_A_up'], axis=0).fillna(0)*dt
+            A_t.ix[~mask] = A_t.ix[~mask] + A_fac
+            imp_t[~mask] = imp_t[~mask] - A_fac.sum(axis=1)[~mask]
 
             # Overproduction reverts to previous norm
-            a_t[~mask] = a_max[~mask] + (a0[~mask]-a_t[~mask]) * dt/self.sector_data['tau_a'].ix[self.sectors]
-            # /Adaptation ======================================================
-            
-            lfd = M_t * lfd_t * (1 - self.settings['xi']*(p_t - 1))
-            #lfd = lfd_t * (1 - self.settings['xi']*(p_t - 1))
-            exp = exp_t * (1 - self.settings['xi']*(p_t - 1))
-            y_adap = (np.linalg.inv(np.eye(n)-A_t)).dot(lfd+exp)
-            #print(pd.DataFrame({1: y_max - y_adap, 2: y_max - y_t}))
-            y_out[ix_t] = y_t
-            lfd_out[ix_t] = lfd
-            imp_out[ix_t] = imp_t*y_t
-            exp_out[ix_t] = exp
-            va_out[ix_t] = self.calc_va(y_t, A_t, imp_t, lab_t)
-            
-        self.y, self.lfd, self.imp, self.exp, self.va = y_out, lfd_out, imp_out, exp_out, va_out
+            a_t[~mask] = a_max[~mask]+(a0[~mask]-a_t[~mask]).div(sec_mask_['tau_a'], axis=0)*dt
+            # /Adaptation =====================================================
+
+            # Apply additional macroeconomic factors
+            lfd = Macro_t * lfd_t * (1 - self.xi*(p_t - 1))
+            #lfd_t = Macro_t * lfd_t * (1 - self.xi*(p_t - 1)) # FIXME
+            exp = exp_t * (1 - self.xi*(p_t - 1))
+            #exp_t = exp_t * (1 - self.xi*(p_t - 1))           # FIXME
+            x_t = (np.linalg.inv(np.eye(self.n_sec)-A_t)).dot(lfd+exp)
+            #x_t = (np.linalg.inv(np.eye(self.n_sec)-A_t)).dot(lfd_t+exp_t)
+
+            x_out.ix[ix_t] = x_t
+            lfd_out.ix[ix_t] = lfd
+            exp_out.ix[ix_t] = exp
+            imp_out.ix[ix_t] = imp_t * x_t
+            va_out.ix[ix_t] = x_t-(A_t.mul(x_t, axis=1).sum(axis=0)+imp_t*x_t)
+
+        # Add full results to class variables
+        self.x, self.x_norm = x_out, x_out.sum(axis=1)/self.x0.sum()
+        self.lfd, self.lfd_norm = lfd_out, lfd_out.sum(axis=1)/self.lfd0.sum()
+        self.exp, self.exp_norm = exp_out, exp_out.sum(axis=1)/self.exp0.sum()
+        self.imp, self.imp_norm = imp_out, imp_out.sum(axis=1)/(self.imp0*self.x0).sum()
+        self.va, self.va_norm = va_out, va_out.sum(axis=1)/self.va0.sum()
+
+        # Aggregate over regions and sectors and assign to class variables
+        self.x_reg = self.x.sum(level=0, axis=1)
+        self.x_reg_norm = self.x_reg.div(self.x0.sum(level=0), axis=1)
+        self.x_sec = self.x.sum(level=1, axis=1)
+        self.x_sec_norm = self.x_sec.div(self.x0.sum(level=1), axis=1)
+
+        self.lfd_reg = self.lfd.sum(level=0, axis=1)
+        self.lfd_reg_norm = self.lfd_reg.div(self.lfd0.sum(level=0), axis=1)
+        self.lfd_sec = self.lfd.sum(level=1, axis=1)
+        self.lfd_sec_norm = self.lfd_sec.div(self.lfd0.sum(level=1), axis=1)
+
+        self.exp_reg = self.exp.sum(level=0, axis=1)
+        self.exp_reg_norm = self.exp_reg.div(self.exp0.sum(level=0), axis=1)
+        self.exp_sec = self.exp.sum(level=1, axis=1)
+        self.exp_sec_norm = self.exp_sec.div(self.exp0.sum(level=1), axis=1)
+
+        self.imp_reg = self.imp.sum(level=0, axis=1)
+        self.imp_reg_norm = self.imp_reg.div((self.imp0*self.x0).sum(level=0), axis=1)
+        self.imp_sec = self.imp.sum(level=1, axis=1)
+        self.imp_sec_norm = self.imp_sec.div((self.imp0*self.x0).sum(level=1), axis=1)
+
+        self.va_reg = self.va.sum(level=0, axis=1)
+        self.va_reg_norm = self.va_reg.div(self.va0.sum(level=0), axis=1)
+        self.va_sec = self.va.sum(level=1, axis=1)
+        self.va_sec_norm = self.va_sec.div(self.va0.sum(level=1), axis=1)
+
+        # Write only Value Added to file
+        if len(self.opath) > 0:
+            self.va.to_csv(join(self.opath, 'va.csv'))
+            self.va_norm.to_csv(join(self.opath, 'va_norm.csv'))
+            self.va_reg.to_csv(join(self.opath, 'va_reg.csv'))
+            self.va_reg_norm.to_csv(join(self.opath, 'va_reg_norm.csv'))
+            self.va_sec.to_csv(join(self.opath, 'va_sec.csv'))
+            self.va_sec_norm.to_csv(join(self.opath, 'va_sec_norm.csv'))
+        print('Complete.')
