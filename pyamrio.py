@@ -64,6 +64,10 @@ class PyAMRIO():
         self.x0 = pd.read_csv(join(rpath, sttgs['x_file']), index_col=0).T.unstack()
         self.exp0 = pd.read_csv(join(rpath, sttgs['e_file']), index_col=0).T.unstack()
 
+        # Fill zeros in x0 and exp0 to prevent divide by zero errors
+        self.x0.replace({0: 1e-12}, inplace=True)
+        self.exp0.replace({0: 1e-12}, inplace=True)
+
         # Calculate local and import technical coefficients and orders
         self.A0 = self.Z0.div(self.x0, axis=1)
         self.o0 = self.A0.dot(self.x0)
@@ -73,6 +77,8 @@ class PyAMRIO():
 
         # Local final demand
         self.lfd0 = self.x0 - self.o0 - self.exp0
+        # Fill zeros in lfd0 to prevent divide by zero errors
+        self.lfd0.replace({0: 1e-12}, inplace=True)
 
         # Normalise imports by total output
         self.imp0 = self.M0.sum(axis=0).div(self.x0)
@@ -135,7 +141,8 @@ class PyAMRIO():
                     print('Converged in {0} iterations.'.format(i))
                     print('Minimum x/o: {0:.3e}'.format((x/A.dot(x)).min()))
                 return x, o, td
-        print('## Not converged ##')
+        print('## Not converged')
+        print('## Minimum x/o: {0:.3e}'.format((x/A.dot(x)).min()))
         return None
 
 
