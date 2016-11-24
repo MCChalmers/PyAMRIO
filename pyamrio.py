@@ -105,13 +105,7 @@ class PyAMRIO():
         Cmax = pd.read_csv(join(rpath, sttgs['c_max']), index_col=[0,1])
         self.x_max0 = pd.concat({reg: Cmax.ix[reg].mul(self.x0.ix[reg], axis=0)
                                  for reg in self.regs}).ix[self.regs]
-
         print('Data loaded successfully.')
-
-
-    def f_p(self, x_t, td_t, Ep):
-        """Calculate sector prices given excess demand factor."""
-        return self.p0*(1 + Ep*((td_t - x_t) / x_t))
 
 
     def bottleneck(self, x, A, f, x_max, itr_max=50, eps=1e-6, verbose=False):
@@ -159,11 +153,13 @@ class PyAMRIO():
 
         # Number of region-sectors; number of time steps; 
         n, m = self.x_max0.shape
+        """
         if self.x_max0.ix[:,-1].min() < 1:
             print('Extending AMRIO model beyond duration of c_max...')
             extension = pd.concat([self.x0]*m, axis=1)
             self.x_max0 = pd.concat([self.x_max0, extension], axis=1)
             m = 2*m
+        """
 
         a_t = pd.Series(np.ones(self.n_sec), index=self.secs, name='a_t')
         a_max = self.sec_data['a_max'].ix[self.secs]
@@ -188,7 +184,7 @@ class PyAMRIO():
             xs_dmd = ((td_t-x_t)/td_t).clip(lower=0)
 
             # Prices, profits and labour demand
-            p_t = self.f_p(x_t, td_t, self.Ed)
+            p_t = self.p0*(1 + self.Ed*((td_t-x_t)/x_t))
             prof_t = p_t*x_t - (A_t.mul(p_t, axis=1).dot(x_t) + (lab_t+imp_t)*x_t)
             Macro_t = (prof_t + lab_t*x_t).sum()/(self.prof0 + self.lab0*self.x0).sum()
 
@@ -246,11 +242,12 @@ class PyAMRIO():
             va_out.ix[ix_t] = x_t-(A_t.mul(x_t, axis=1).sum(axis=0)+imp_t*x_t)
 
         # Add full results to class variables
-        self.x, self.x_norm = x_out, x_out.sum(axis=1)/self.x0.sum()
-        self.lfd, self.lfd_norm = lfd_out, lfd_out.sum(axis=1)/self.lfd0.sum()
-        self.exp, self.exp_norm = exp_out, exp_out.sum(axis=1)/self.exp0.sum()
-        self.imp, self.imp_norm = imp_out, imp_out.sum(axis=1)/(self.imp0*self.x0).sum()
-        self.va, self.va_norm = va_out, va_out.sum(axis=1)/self.va0.sum()
+        self.x, self.x_norm = x_out, x_out.div(self.x0, axis=1)
+        self.lfd, self.lfd_norm = lfd_out, lfd_out.div(self.lfd0, axis=1)
+        self.exp, self.exp_norm = exp_out, exp_out.div(self.exp0, axis=1)
+        #self.imp, self.imp_norm = imp_out, imp_out.div(self.imp0*self.x0, axis=1)
+        self.imp = imp_out
+        self.va, self.va_norm = va_out, va_out.div(self.va0, axis=1)
 
         # Aggregate over regions and sectors and assign to class variables
         self.x_reg = self.x.sum(level=0, axis=1)
@@ -269,9 +266,9 @@ class PyAMRIO():
         self.exp_sec_norm = self.exp_sec.div(self.exp0.sum(level=1), axis=1)
 
         self.imp_reg = self.imp.sum(level=0, axis=1)
-        self.imp_reg_norm = self.imp_reg.div((self.imp0*self.x0).sum(level=0), axis=1)
+        #self.imp_reg_norm = self.imp_reg.div((self.imp0*self.x0).sum(level=0), axis=1)
         self.imp_sec = self.imp.sum(level=1, axis=1)
-        self.imp_sec_norm = self.imp_sec.div((self.imp0*self.x0).sum(level=1), axis=1)
+        #self.imp_sec_norm = self.imp_sec.div((self.imp0*self.x0).sum(level=1), axis=1)
 
         self.va_reg = self.va.sum(level=0, axis=1)
         self.va_reg_norm = self.va_reg.div(self.va0.sum(level=0), axis=1)
