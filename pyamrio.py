@@ -1,5 +1,4 @@
 # coding: utf-8
-
 """
 Python implementation of Adaptive Multi-Regional Input-Output (AMRIO) model.
 
@@ -11,10 +10,8 @@ from os import listdir, makedirs
 from json import load
 import numpy as np
 import pandas as pd
-from scipy.linalg import block_diag
 
-
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 class PyAMRIO():
     """Load settings, regions, sectors and IO information."""
@@ -23,7 +20,7 @@ class PyAMRIO():
         with open(f_sttgs) as f:
             self.settings = load(f)
         sttgs_list = str(list(range(len(self.settings))))
-        print('Settings {0} available.'.format(sttgs_list))
+        print('Settings available: ', sttgs_list)
 
 
     def load(self, n):
@@ -49,14 +46,11 @@ class PyAMRIO():
         self.n_reg = self.regs.size
         sec_data = pd.read_csv(join(rpath, sttgs['secs_file']), index_col=0)
         self.sec_data = pd.concat({r: sec_data for r in self.regs}, keys=self.regs)
-
         self.secs = self.sec_data.index
         self.n_sec = self.secs.size
         self.dt = sttgs['dt_1']
         self.eps = sttgs['eps']
         self.convg_lim = sttgs['convg_lim']
-        self.Ed = sttgs['Ed']
-        self.xi = sttgs['xi']
 
         # Load disaggregated IO tables in standard format
         self.Z0 = pd.read_csv(join(rpath, sttgs['Z_file']), index_col=[0,1], header=[0,1])
@@ -64,24 +58,34 @@ class PyAMRIO():
         self.x0 = pd.read_csv(join(rpath, sttgs['x_file']), index_col=0).T.unstack()
         self.exp0 = pd.read_csv(join(rpath, sttgs['e_file']), index_col=0).T.unstack()
 
+        # Multi-region and sector index - used to set up new DataFrames
+        self.ix = self.Z0.index
+
+        # Masks for intra- and inter-regional flows
+        self.intra_mask = pd.DataFrame(np.zeros((self.n_sec, self.n_sec)),
+                                       index=self.ix, columns=self.ix)
+        for reg in self.regs:
+            self.intra_mask.ix[reg, reg] = 1
+        self.inter_mask = 1 - self.intra_mask
+        self.inter2intra_mask = self.intra_mask - self.inter_mask
+
         # Fill zeros in x0 and exp0 to prevent divide by zero errors
         self.x0.replace({0: 1e-12}, inplace=True)
         self.exp0.replace({0: 1e-12}, inplace=True)
 
-        # Calculate local and import technical coefficients and orders
+        # Calculate technical coefficients, orders and intermediate consumption
         self.A0 = self.Z0.div(self.x0, axis=1)
         self.o0 = self.A0.dot(self.x0)
-
-        # Value added (total output less intermediate consumption)
-        self.va0 = self.x0 - self.Z0.sum(axis=0) - self.M0.sum(axis=0)
-
-        # Local final demand
-        self.lfd0 = self.x0 - self.o0 - self.exp0
-        # Fill zeros in lfd0 to prevent divide by zero errors
-        self.lfd0.replace({0: 1e-12}, inplace=True)
-
+        self.i0 = self.Z0.sum(axis=0)
         # Normalise imports by total output
         self.imp0 = self.M0.sum(axis=0).div(self.x0)
+
+        # Value added (total output less intermediate consumption and imports)
+        self.va0 = self.x0 - self.i0 - self.imp0*self.x0
+
+        # Final demand (Fill zeros in f0 to prevent divide by zero errors)
+        self.f0 = self.x0 - self.o0 - self.exp0
+        self.f0.replace({0: 1e-12}, inplace=True)
 
         # Calculate labour input
         # Proportional contributions of labour and capital to Gross Value Added
@@ -90,22 +94,23 @@ class PyAMRIO():
         # Disaggregated labour input (labour:capital regionally invariant)
         self.lab0 = self.va0.mul(gva_norm['LAB'], level=1).div(self.x0)
 
-        # Profits
-        self.prof0 = self.x0 - self.o0 - (self.lab0 + self.imp0)*self.x0
-
-        # Industries which are subsitutable by imports
-        self.sig = self.sec_data['sig']
+        # Profits: value added less payments to labour
+        self.prof0 = self.va0 - self.lab0*self.x0
 
         # Initialise price vector
         self.p0 = np.ones(self.n_sec)
 
+        # Time constants for adaptation
+        self.tau = self.sec_data[['f_up','f_dn','exp_up','exp_dn',
+                                  'A_up','A_dn','a_up','a_dn']]
+
+        # Overproduction factors
+        self.a0, self.a_max = self.sec_data['a0'], self.sec_data['a_max']
+
         # Pre-event balance of supply & demand
-        sd_bal0 = np.abs(self.lfd0 + self.exp0 + self.o0 - self.x0).max()
+        sd_bal0 = np.abs(self.f0 + self.exp0 + self.o0 - self.x0).max()
         if sd_bal0 > sttgs['convg_lim']:
             print('Initial supply-demand imbalance: {0:3.4e}'.format(sd_bal0))
-
-        # Multi-region and sector index - used to set up new DataFrames
-        self.ix = self.Z0.index
 
         # Load supply constraint data and assemble matrix
         Cmax = pd.read_csv(join(rpath, sttgs['c_max']), index_col=[0,1])
@@ -114,69 +119,62 @@ class PyAMRIO():
         print('Data loaded successfully.')
 
 
-    def bottleneck(self, x, A, f, x_max, itr_max=50, eps=1e-6, verbose=False):
+    def ration(self, x, A, f, x_max, itr_max=100, eps0=1e-6, eps1=1e-9):
         """Hallegatte's priority + proportional rationing algorithm."""
 
-        L = np.linalg.inv(np.eye(A.shape[0])-A)
-        td = L.dot(f)
-        x = np.minimum(x_max, td)
-
-        for i in range(itr_max):
+        for i in range(1, itr_max+1):
             # For checking convergence
             x0 = x.copy()
 
-            # Calculate orders and total demand
-            o = A.dot(x)
-            chk = np.array(x/o).clip(max=1)
-            sc = chk.min()
-            x[chk==1] = x[chk==1]*sc
-
-            # Recalculate total demand
+            # Calculate total demand, and cap x at min(x_max, td)
             td = A.dot(x) + f
-            x = np.minimum(np.minimum(x_max, td), x)
+            x = np.minimum(x_max, td)
+
+            # Calculate orders, and ration orders and final demand
+            o = A.dot(x)
+            factor = np.array(x/o).clip(min=0, max=1).min()
+            x, f = x*factor, f*factor
 
             # Check convergence
-            if (np.abs(x - x0).max() < eps):
-                if verbose:
-                    print('Converged in {0} iterations.'.format(i))
-                    print('Minimum x/o: {0:.3e}'.format((x/A.dot(x)).min()))
-                return x, o, td
-        print('## Not converged')
-        print('## Minimum x/o: {0:.3e}'.format((x/A.dot(x)).min()))
+            if (np.abs(x-x0).max() < eps0) and (x/A.dot(x)).min() >= (1-eps1):
+                return x, A.dot(x)
+        print('## Not converged: {0:.3e}'.format(np.abs(x-x0).max()))
+        print('## Minimum x/o: {0}'.format((x/A.dot(x)).min()))
         return None
 
 
-    def amrio(self):
+    def agg(self, q, q0):
+        """Aggregate AMRIO output by region and by sector, and normalise."""
+
+        agg_reg, agg_sec = q.sum(level=0, axis=1), q.sum(level=1, axis=1)
+        agg_reg0, agg_sec0 = q0.sum(level=0), q0.sum(level=1)
+        return agg_reg/agg_reg0, agg_sec/agg_sec0
+
+
+    def amrio(self, sttg=0, verbose=False):
         """Run model."""
 
-        x_t = self.x0.copy()
-        lfd_t = self.lfd0.copy()
-        exp_t = self.exp0.copy()
-        imp_t = self.imp0.copy()
-        lab_t = self.lab0.copy()
-        dt, eps = self.dt, self.eps
+        # Load analysis settings and data
+        self.load(sttg)
 
-        A_t = self.A0.copy()
+        # Model parameters
+        dt, eps, sig, tau = self.dt, self.eps, self.sec_data['sig'], self.tau
+        Ed, gamma_p = self.sec_data['Ed'], self.sec_data['gamma_p']
 
-        # Number of region-sectors; number of time steps; 
-        n, m = self.x_max0.shape
-        """
-        if self.x_max0.ix[:,-1].min() < 1:
-            print('Extending AMRIO model beyond duration of c_max...')
-            extension = pd.concat([self.x0]*m, axis=1)
-            self.x_max0 = pd.concat([self.x_max0, extension], axis=1)
-            m = 2*m
-        """
+        # Initialise object variables for all results
+        shp = {'index': self.x_max0.columns, 'columns': self.ix}
+        self.x, self.o = pd.DataFrame(**shp), pd.DataFrame(**shp)
+        self.f, self.exp = pd.DataFrame(**shp), pd.DataFrame(**shp)
+        self.imp, self.i = pd.DataFrame(**shp), pd.DataFrame(**shp)
+        self.va = pd.DataFrame(**shp)
+        self.p = pd.DataFrame(**shp)
 
-        a_t = pd.Series(np.ones(self.n_sec), index=self.secs, name='a_t')
-        a_max = self.sec_data['a_max'].ix[self.secs]
-        a0 = self.sec_data['a0'].ix[self.secs]
-
-        x_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
-        lfd_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
-        exp_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
-        imp_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
-        va_out = pd.DataFrame(index=self.x_max0.columns, columns=self.ix)
+        # Declare temportary variables
+        x_t, A_t = self.x0.copy(), self.A0.copy()
+        f_t, exp_t = self.f0.copy(), self.exp0.copy()
+        imp_t, lab_t = self.imp0.copy(), self.lab0.copy()
+        p_t = self.p0.copy()
+        a0, a_max, a_t = self.a0.copy(), self.a_max.copy(), self.a0.copy()
 
         # Time stepping
         print('AMRIO model running...')
@@ -184,110 +182,112 @@ class PyAMRIO():
             # Increase maximum output by overproduction factor
             x_max = x_max_t.mul(a_t, level=1, axis=0)
 
-            # Production bottlenecking
-            x_t, o_t, td_t = self.bottleneck(x_t, A_t, lfd_t+exp_t, x_max)
+            # Ration production in case of bottlenecking
+            x_t, o_t = self.ration(x_t, A_t, f_t+exp_t, x_max)
 
-            # Excess demand factor
+            # Recalculate total demand and excess demand factor
+            td_t = o_t + f_t + exp_t
             xs_dmd = ((td_t-x_t)/td_t).clip(lower=0)
 
-            # Prices, profits and labour demand
-            p_t = self.p0*(1 + self.Ed*((td_t-x_t)/x_t))
-            prof_t = p_t*x_t - (A_t.mul(p_t, axis=1).dot(x_t) + (lab_t+imp_t)*x_t)
-            Macro_t = (prof_t + lab_t*x_t).sum()/(self.prof0 + self.lab0*self.x0).sum()
+            # Prices, profits and macroeconomic factors
+            p_t = p_t*(1 + gamma_p*dt*((td_t-x_t)/x_t))
+            i_t = A_t.mul(p_t, axis=0).mul(x_t, axis=1).sum(axis=0)
+            prof_t = p_t*x_t - i_t - lab_t*x_t - imp_t*x_t
+            Macro_t = (prof_t + lab_t*x_t).sum(level=0)/self.va0.sum(level=0)
 
-            # Adaptation ======================================================
-            # If total demand exceeds supply
-            mask = td_t - x_t > 1
-            sig = self.sig[mask]
-            sig_ = self.sig[~mask]
-            xs = xs_dmd[mask]
-            sec_mask = self.sec_data.ix[mask]
-            sec_mask_ = self.sec_data.ix[~mask]
+            # Save results in class variables
+            self.x.ix[ix_t], self.o.ix[ix_t] = x_t, o_t
+            self.f.ix[ix_t], self.exp.ix[ix_t] = f_t, exp_t
+            self.imp.ix[ix_t] = imp_t*x_t
+            self.i.ix[ix_t] = i_t
+            # Calculate value added using increased prices for input and output
+            self.va.ix[ix_t] = p_t*x_t - i_t - imp_t*x_t
+            self.p.ix[ix_t] = p_t
 
-            # Final demand - final demand and exports reduce--------
-            lfd_t[mask] = lfd_t[mask]*(1-sig*xs*dt/sec_mask['tau_lfd_down'])
-            exp_t[mask] = exp_t[mask]*(1-sig*xs*dt/sec_mask['tau_exp_down'])
+            # Adaptation - if total demand exceeds supply =====================
+            # Region-sectors where total demand exceeds total output
+            mask = (td_t-x_t) > self.eps
 
-            # Intermediate consumption - inter-industry consumption reduces and imports increase
-            delta = A_t.ix[mask].mul(xs_dmd[mask]*sig, axis=0).div(sec_mask['tau_A_down'], axis=0)
-            A_t.ix[mask] = A_t.ix[mask] - delta*dt
-            imp_t[mask] = imp_t[mask] + delta.sum(axis=1)*dt
+            # Final demand and exports from the region-sector switch to others
+            delta_f = f_t*sig*xs_dmd*dt/tau['f_dn']
+            f_t[mask] = f_t[mask] * (1 - sig*xs_dmd*dt/tau['f_dn'])[mask]
+            f_t[~mask] = f_t[~mask] * (1 - sig*xs_dmd*dt/tau['f_dn'])[~mask]
 
-            # Production - overproduction where possible
-            a_t[mask] = a_max[mask] + (a_max[mask]-a_t[mask]) * xs_dmd[mask] *dt/sec_mask['tau_a']
+            delta_exp = exp_t * sig * xs_dmd
+            exp_t[mask] = exp_t[mask]*(1 - sig*xs_dmd*dt/tau['exp_dn'])[mask]
+            exp_t[~mask] = exp_t[~mask]*(1 - sig*xs_dmd*dt/tau['exp_dn'])[~mask]
+
+            """
+            print(ix_t, '\n', pd.concat([delta_f[mask], delta_f[~mask]], axis=1))
+            if ix_t == 'Month-3':
+                return f_t, delta_f, mask
+            """
+
+            # Rebalance intermediate consumption
+            delta = A_t.mul(sig*xs_dmd, axis=0).div(tau['A_dn'], axis=0)
+
+            # Redirect inter-regional flows to within the region
+            d_inter2intra = (self.inter2intra_mask*delta).sum(axis=1, level=1)
+            for r in self.regs:
+                delta.loc[r, r] = d_inter2intra.ix[r].values
+
+            """
+            if sum(mask) > 1:
+                print(ix_t, sum(mask))
+                return(A_t, A_t[mask], delta, A_t[~mask])
+            """
+
+            A_t.ix[mask] = A_t.ix[mask] - delta.ix[mask]*dt
+
+            # Imports increase
+            imp_t = imp_t + delta.ix[mask].sum(axis=0)*dt
+
+            # Overproduction where possible
+            a_t[mask] = a_max[mask] + ((a_max-a_t)*xs_dmd*dt/tau['a_up'])[mask]
 
             # Otherwise... ----------------------------------------------------
             # Local final demands and exports recover to pre-disaster levels
-            lfd_fac = (eps+lfd_t[~mask]/self.lfd0[~mask])*(self.lfd0[~mask]-lfd_t[~mask]).div(sec_mask_['tau_lfd_up'], axis=0)
-            lfd_t[~mask] = lfd_t[~mask] + sig_*lfd_fac[~mask]*dt
-            exp_fac = (eps+exp_t[~mask]/self.exp0[~mask])*(self.exp0[~mask]-exp_t[~mask]).div(sec_mask_['tau_exp_up'], axis=0)
-            exp_t[~mask] = exp_t[~mask] + sig_*exp_fac[~mask]*dt
+            f_fac = (eps+f_t/self.f0)*(self.f0-f_t)/tau['f_up']
+            f_t[~mask] = f_t[~mask] + (sig*f_fac)[~mask]*dt
+            exp_fac = (eps+exp_t/self.exp0)*(self.exp0-exp_t)/tau['exp_up']
+            exp_t[~mask] = exp_t[~mask] + (sig*exp_fac)[~mask]*dt
 
             # Intermediate consumption recovers to pre-disaster levels
-            A_fac1 = (eps+A_t.ix[~mask]/self.A0.ix[~mask])
-            A_fac2 = (self.A0.ix[~mask]-A_t.ix[~mask])
-            A_fac = (A_fac1*A_fac2).div(sec_mask_['tau_A_up'], axis=0).fillna(0)*dt
-            A_t.ix[~mask] = A_t.ix[~mask] + A_fac
-            imp_t[~mask] = imp_t[~mask] - A_fac.sum(axis=1)[~mask]
+            A_fac = (eps+A_t/self.A0).fillna(1)*(self.A0-A_t)/tau['A_up']
+            A_t.ix[~mask] = A_t.ix[~mask] + A_fac.ix[~mask]*dt
+            imp_t = imp_t - A_fac.ix[~mask].sum(axis=0)*dt
 
             # Overproduction reverts to previous norm
-            a_t[~mask] = a_max[~mask]+(a0[~mask]-a_t[~mask]).div(sec_mask_['tau_a'], axis=0)*dt
+            a_t[~mask] = a_max[~mask] + ((a0-a_t)/tau['a_dn'])[~mask]*dt
             # /Adaptation =====================================================
 
-            # Apply additional macroeconomic factors
-            lfd = Macro_t * lfd_t * (1 - self.xi*(p_t - 1))
-            #lfd_t = Macro_t * lfd_t * (1 - self.xi*(p_t - 1)) # FIXME
-            exp = exp_t * (1 - self.xi*(p_t - 1))
-            #exp_t = exp_t * (1 - self.xi*(p_t - 1))           # FIXME
-            x_t = (np.linalg.inv(np.eye(self.n_sec)-A_t)).dot(lfd+exp)
-            #x_t = (np.linalg.inv(np.eye(self.n_sec)-A_t)).dot(lfd_t+exp_t)
+            # Apply price elasticity and macroeconomic factors to final demand
+            f_t = (f_t * (1 - Ed*(p_t-1)))#.mul(Macro_t, level=0)
+            exp_t = (exp_t * (1 - Ed*(p_t-1)))
 
-            x_out.ix[ix_t] = x_t
-            lfd_out.ix[ix_t] = lfd
-            exp_out.ix[ix_t] = exp
-            imp_out.ix[ix_t] = imp_t * x_t
-            va_out.ix[ix_t] = x_t-(A_t.mul(x_t, axis=1).sum(axis=0)+imp_t*x_t)
+        # Calculate normalised results
+        self.x_norm = self.x/self.x0
+        self.f_norm = self.f/self.f0
+        self.exp_norm = self.exp/self.exp0
+        self.imp_norm = self.imp/(self.imp0*self.x0)
+        self.va_norm = self.va/self.va0
 
-        # Add full results to class variables
-        self.x, self.x_norm = x_out, x_out.div(self.x0, axis=1)
-        self.lfd, self.lfd_norm = lfd_out, lfd_out.div(self.lfd0, axis=1)
-        self.exp, self.exp_norm = exp_out, exp_out.div(self.exp0, axis=1)
-        #self.imp, self.imp_norm = imp_out, imp_out.div(self.imp0*self.x0, axis=1)
-        self.imp = imp_out
-        self.va, self.va_norm = va_out, va_out.div(self.va0, axis=1)
+        # Check for negative values
+        if self.va_norm.values.min() < 0:
+            print('## Warning: some value added quantities are negative.')
 
-        # Aggregate over regions and sectors and assign to class variables
-        self.x_reg = self.x.sum(level=0, axis=1)
-        self.x_reg_norm = self.x_reg.div(self.x0.sum(level=0), axis=1)
-        self.x_sec = self.x.sum(level=1, axis=1)
-        self.x_sec_norm = self.x_sec.div(self.x0.sum(level=1), axis=1)
+        # Aggregate over regions and sectors and normalise
+        self.x_reg_norm, self.x_sec_norm = self.agg(self.x, self.x0)
+        self.f_reg_norm, self.f_sec_norm = self.agg(self.f, self.f0)
+        self.exp_reg_norm, self.exp_sec_norm = self.agg(self.exp, self.exp0)
+        self.imp_reg_norm, self.imp_sec_norm = self.agg(self.imp*self.x,
+                                                        self.imp0*self.x0)
+        self.va_reg_norm, self.va_sec_norm = self.agg(self.va, self.va0)
 
-        self.lfd_reg = self.lfd.sum(level=0, axis=1)
-        self.lfd_reg_norm = self.lfd_reg.div(self.lfd0.sum(level=0), axis=1)
-        self.lfd_sec = self.lfd.sum(level=1, axis=1)
-        self.lfd_sec_norm = self.lfd_sec.div(self.lfd0.sum(level=1), axis=1)
-
-        self.exp_reg = self.exp.sum(level=0, axis=1)
-        self.exp_reg_norm = self.exp_reg.div(self.exp0.sum(level=0), axis=1)
-        self.exp_sec = self.exp.sum(level=1, axis=1)
-        self.exp_sec_norm = self.exp_sec.div(self.exp0.sum(level=1), axis=1)
-
-        self.imp_reg = self.imp.sum(level=0, axis=1)
-        #self.imp_reg_norm = self.imp_reg.div((self.imp0*self.x0).sum(level=0), axis=1)
-        self.imp_sec = self.imp.sum(level=1, axis=1)
-        #self.imp_sec_norm = self.imp_sec.div((self.imp0*self.x0).sum(level=1), axis=1)
-
-        self.va_reg = self.va.sum(level=0, axis=1)
-        self.va_reg_norm = self.va_reg.div(self.va0.sum(level=0), axis=1)
-        self.va_sec = self.va.sum(level=1, axis=1)
-        self.va_sec_norm = self.va_sec.div(self.va0.sum(level=1), axis=1)
-
-        # Write only Value Added to file
+        # Write value added output to file
         if len(self.opath) > 0:
             self.va.to_csv(join(self.opath, 'va.csv'))
             self.va_norm.to_csv(join(self.opath, 'va_norm.csv'))
-            self.va_reg.to_csv(join(self.opath, 'va_reg.csv'))
             self.va_reg_norm.to_csv(join(self.opath, 'va_reg_norm.csv'))
-            self.va_sec.to_csv(join(self.opath, 'va_sec.csv'))
             self.va_sec_norm.to_csv(join(self.opath, 'va_sec_norm.csv'))
         print('Complete.')

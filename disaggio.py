@@ -24,6 +24,9 @@ def disagg(f_sttgs='sttgs_disagg.json'):
     M0 = pd.read_csv(sttgs['M_filein'], index_col=0)
     x0 = pd.read_csv(sttgs['x_filein'], index_col=0)['x0']
     e0 = pd.read_csv(sttgs['e_filein'], index_col=0)['e0']
+    # Replace 0s in x0 with a small number to prevent divide by zero errors
+    x0 = x0.replace({0: 1e-12})
+
     # Calculate final demand
     f0 = x0 - Z0.sum(axis=1) - e0
 
